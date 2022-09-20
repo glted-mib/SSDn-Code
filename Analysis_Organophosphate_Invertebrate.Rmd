@@ -1,0 +1,2186 @@
+---
+title: "Analysis_05_Organophosphate_Invertebrate"
+author: "Alex Dhond"
+date: "7/14/2022"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Introduction
+
+The purpose of this script is to analyze the ORGANOPHOSPHATE data set with INVERTEBRATE SPECIES ONLY. The script will:
+
+1. Extract the species located in the first quartile of the data; this information will be useful in terms of plotting.
+2. Build single-chemical SSDs and extract the true HC5 values
+3. Using the leave-one-out approach, build single-chemical SSDs and extract HC5s along with variance estimates.
+4. Using all possible combinations of chemicals, create multiple SSDns with multiple nSpecies to get estimates of HC5 values
+5. Summarize results generated and prepare plots
+6. Plot relevant data
+
+### Clear the existing workspace
+```{r}
+# Clear existing workspace
+rm(list = ls())
+```
+
+### Load in required packages
+```{r}
+library(dplyr) # Used for data manipulation
+library(tidyr) # data manipulation
+library(RcppAlgos) # Used to create random draws of chemicals
+library(data.table) # Used for creating data tables
+library(EnvStats) # Used for calculating geometric means
+library(plotrix) # used for calculating standard error
+library(fitdistrplus) # for fitting various distributions to the data
+library(flexsurv) # for fitting parametric distributions
+library(ggplot2) # for plotting
+library(ggpubr) # for exporting plots
+library(scales) # for plot scales
+```
+
+### Load in the source data
+Load in WEB-ICE data, prefiltered for only chemicals with data for 8+ species
+```{r}
+# Read in the WEB ICE data
+data <- read.csv("ICE_data_8_species.csv")
+```
+
+### Filter the data to only include organophosphate chemicals and fish species
+```{r}
+# Filter to only include organophosphate chemicals 
+data <- data %>%
+  filter(
+    Specific_MOA == "Organophosphate"
+  )
+
+
+# Filter by all invertebrate taxonomic groups in the dataset 
+data <- data %>%
+  filter(
+    Taxa == "Crustacean" | Taxa == "Crustacean (Decapod)" | Taxa == "Crustacean (Fairy shrimp)" | Taxa == "Insect" | Taxa == "Worm" | Taxa == "Rotifer" | Taxa =="Mollusc"
+  )
+
+# Check how many chemicals we have
+unique(data$Chemical)
+```
+
+# Check the organophosphate data to see which chemicals have the most fish species and which do not
+```{r}
+# Filter and summarize the OP data to see which chemicals have the most species
+species_summary <- data %>% 
+  dplyr::group_by(Chemical) %>% # group by chemical
+  summarise(
+    number_species = n_distinct(Species)) %>% # calculate number of species
+  arrange(desc(number_species)) # arrange in descending order (most species at top)
+
+# Looking at this data, there are 10 chemicals with at least 8 different invertebrate species.
+
+# select the chems that have 8 or more inverts and make a vector to filter the main data by
+chems_w_8_plus <- species_summary %>%
+  filter(number_species >= 8) %>%
+  dplyr::select(Chemical) 
+
+# Make it a vector
+chems_8_plus_vector <- chems_w_8_plus$Chemical
+
+
+# Filter the main dataset to only include these chemicals
+data <- data %>%
+  filter(
+    Chemical %in% chems_8_plus_vector
+  )
+
+# So, the "chems_8_plus_vector" represents the organophosphate chemicals that have data for 8 or more invertebrate species only. We have filtered the main data by it, and now have 10 OP chemicals that have data for 8 species.
+```
+
+### Extract relevant information for supplementary tables
+How many species are there per chemical, what are range of toxicity values, etc.
+```{r}
+# Minimum tox value for overall dataset
+min(data$Conc) 
+
+# Maximum tox value for overall dataset
+max(data$Conc)
+
+
+### Chlorpyrifos
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Chlorpyrifos"])), "species in Chlorpyrifos"))
+
+### Diazinon
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Diazinon"])), "species in Diazinon"))
+
+### Dichlorvos
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Dichlorvos"])), "species in Dichlorvos"))
+
+### Fenitrothion
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Fenitrothion"])), "species in Fenitrothion"))
+
+### Fenthion
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Fenthion"])), "species in Fenthion"))
+
+### Malathion
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Malathion"])), "species in Malathion"))
+
+### Methyl parathion
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Methyl parathion"])), "species in Methyl parathion"))
+
+### Naled
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Naled"])), "species in Naled"))
+
+### Parathion
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Parathion"])), "species in Parathion"))
+
+### Trichlorfon
+# How many species are there per chemical?
+print(paste("There are", length(unique(data$Species[data$Chemical == "Trichlorfon"])), "species in Trichlorfon"))
+```
+
+# 1. Extract species data for first quartile
+
+Extracting which species are in the first quartile (ie most sensitive species) for all chemicals is useful for making plots at the end.
+
+### Find the species in the first quartile
+The variable "all.chem.OP" represents the 10 organophosphate chemicals we will be using for this analysis.
+```{r}
+# Create a list of organophosphates (should be 10)
+all.chem.OP <- c("Chlorpyrifos", "Diazinon", "Dichlorvos", "Fenitrothion", "Fenthion", "Malathion", "Methyl parathion", "Naled", "Parathion", "Trichlorfon")
+
+# Create an empty list for the most sensitive species
+most.sensitive.species <- list()
+
+# Create a loop to iterate through all the chemicals in the set
+for(i in all.chem.OP) {
+
+  #Calculating the average toxicity value (LC50) for each species 
+  IndividualSSDs <- data %>% 
+    filter(Chemical == i) %>%
+    group_by(Species) %>%
+    summarise(
+      average = geoMean(Conc), # here I am using "average" instead of "geomean" as earlier
+      minimum = min(Conc),
+      sd = sd(Conc),
+      n = n())
+  
+  IndividualSSDs <- unique(IndividualSSDs) #Adding toxicity data for each chemical to a list and making sure there are no duplicates
+  
+  # Create intermediate data frame
+  Newdf <- IndividualSSDs
+  
+  #Calculating the probability points for each species and order them
+  df <- Newdf[order(Newdf$average),]
+  df$frac <- ppoints(df$average, 0.5)
+  
+  # Create intermediate data frame and filter by the lowest quartile
+  most.sensitive.sp <- df %>%
+  filter(
+    average <= quantile(df$average, probs = 0.25))
+  
+  # Combine the data for this chemical into a data frame
+  most.sensitive.sp.table <- data.frame(i, most.sensitive.sp)
+  
+  # Save this run of the loop as a place in the list
+  most.sensitive.species[[i]] <- most.sensitive.sp.table
+}
+
+# Bind all of the elements of the list together into one data frame
+most.sensitive.species <- rbindlist(most.sensitive.species)
+
+# Rename the column names
+colnames(most.sensitive.species) <- c("Chemical", "Species", "average", "minimum", "sd", "n", "frac")
+```
+
+# 2. Build single-chemical SSDs and extract HC5 values
+We need to get the "true" HC5 values from the single chemical SSDs. The following code builds the single chemical SSDs and extracts the HC5 values from them.
+
+### Extracting HC5 values for single chemicals
+```{r}
+# Create a list of chemicals from my data set
+single.ssd.chems <- unique(data$Chemical)
+
+# The individual.hc5s list will contain HC5 values from chemical-specific SSDs built using the best-fit method. These HC5s will be compared to the HC5s derived from SSDns.
+individual.hc5s <- list()
+
+#This loop calculates HC5 values from chemical-specific SSDs for each chemical in the all.chems list. It uses the best-fit method to fit the most appropriate distribution to individual chemical toxicity data (out of log-normal, log-logisitc, Weibull, and gamma distributions). The Anderson-Darling statistic is used to determine best-fit. The distribution with the lowest Anderson-Darling statistic is assigned as the "best.fit" method.
+for(i in single.ssd.chems) {
+  
+  fit_gamma <- NULL
+  best.fit <- NULL
+  
+  #Calculating the average toxicity value (LC50) for each species 
+  IndividualSSDs <- data %>% filter(Chemical == i) %>%
+    group_by(Species) %>%
+    summarise(
+      average = geoMean(Conc), # here I am using "average" instead of "geomean" as earlier
+      minimum = min(Conc),
+      sd = sd(Conc),
+      n = n())
+  
+  IndividualSSDs <- unique(IndividualSSDs) #Adding toxicity data for each chemical to a list and making sure there are no duplicates
+  
+  # Create intermediate data frame
+  Newdf <- IndividualSSDs
+  
+  #Calculating the probability points for each species 
+  df <- Newdf[order(Newdf$average),]
+  df$frac <- ppoints(df$average, 0.5)
+  df
+  
+  #Fit a distribution to the plotted points
+  fit_llogis <- fitdist(df$average, "llogis")
+  fit_lnorm <- fitdist(df$average, "lnorm")
+  fit_gamma <- try(fitdist(df$average, "gamma"), silent = TRUE) # use try here as gamma often fails
+  fit_weibull <- fitdist(df$average, "weibull")
+  
+  # if there is an error with the gamma distribution, fit the other three instead
+  if("try-error" %in% class(fit_gamma)){
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+  }  else {
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    g <- gofstat(fit_gamma)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], g[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "gamma", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]}
+  
+  #Calculate the best fit distribution
+  best.fit <- fitdist(df$average, b)
+  
+  # Extract the estimated HC5 value
+  hc5 <- quantile(best.fit, probs = 0.05)
+  Estimated_HC5 <- hc5$quantiles$`p=0.05`
+  
+  # Bootstrap the HC5 value with upper and lower CIs
+  fit_boot <- bootdist(best.fit, bootmethod = 'param', niter = 1000)
+  
+  # This step is not necessary I am just using it to check the bootstrap is working
+  bootstrap_hc5 <- quantile(fit_boot, probs = 0.05)
+  
+  # Save the bootstrap and upper and lower confidence intervals
+  Bootstrapped_HC5 <- bootstrap_hc5$quantiles$`p=0.05`
+  HC5_lower_ci <- bootstrap_hc5$quantCI[1,1]
+  HC5_upper_ci <- bootstrap_hc5$quantCI[2,1]
+  
+  # Save the HC5 values
+  hc5.table <- data.frame(i, Estimated_HC5, Bootstrapped_HC5, HC5_lower_ci, HC5_upper_ci, b, m)
+  
+  individual.hc5s[[i]] <- hc5.table
+}
+
+#Binding the list of individual SSD hc5 values together 
+individual.hc5s <- rbindlist(individual.hc5s)
+colnames(individual.hc5s) <- c("Chemical", "SSD Estimated HC5", "SSD Bootstrapped HC5", "HC5 Lower CI", "HC5 Upper CI", "SSD Dist.", "SSD AD")
+
+# Save the single-chemical HC5s as their own dataframe
+single.individual.HC5s <- individual.hc5s
+```
+
+
+We have calculated the single-chemical HC5s, which are a good baseline and represent the "classic" SSD approach. Now, I will use the leave-one-out (LOO) approach to calculate the HC5s along with variance estimates.
+
+# 3. Build and calculate LOO single-chemical SSDs and extract HC5 values.
+The LOO approach we decided to use was to first make an SSD with the maximum possible number of species (N). Then, remove one species from the dataset so that the total number of species is (N-1). Using the dataset of (N-1) species, we make another SSD. We would continue to do that until all possible combinations of (N-1) species have been used to make an SSD.
+
+In short, if there were N total species in the original chemical data, then the total number of single-chemical SSDs we could make using this method are N (N possible combinations of N-1 species)
+
+### LOO Loop Generation
+NOTE: The warning/error messages it may give are only because the code fits all four distributions (and most of the time, the gamma distribution gives an error). The code fits the best-fit distribution (which does not show an error code)
+```{r}
+# Create a list of chemicals from my data set
+single.ssd.chems <- c("Chlorpyrifos", "Diazinon", "Dichlorvos", "Fenitrothion", "Fenthion", "Malathion", "Methyl parathion", "Naled", "Parathion", "Trichlorfon")
+
+# Initialize the lists that will hold the outputs for the chemicals
+individual.hc5s.for.chem <- list()
+individual.hc5s <- list()
+
+# Create the loop (it is very similar to creating a normal SSD)
+for(i in single.ssd.chems) {
+  
+  #filter by the chemical
+  IndividualSSDs <- data %>% 
+    filter(Chemical == i)
+  
+  # get a list of species and store the length as a variable
+  species.list <- unique(IndividualSSDs$Species)
+  species.list.length <- length(species.list)
+
+  # create all possible species combinations (such that there are N combinations of N-1 species)
+  species.combinations <- list(
+  data.table(comboSample(species.list, m = (species.list.length-1), n = species.list.length, repetition = FALSE)))
+
+  # bind all the species combos together
+  species.combos.data <- rbindlist(species.combinations)
+  
+  # initialize a list to hold the species 
+  overall.sp.list <- list()
+  
+  # iterate through and create a species list
+  for (j in 1:(length(species.combos.data)+1)){
+  # Take the current row (j) and save it as a character vector into a list  
+    current.sp.list <- as.character(species.combos.data[j,])
+    overall.sp.list[[j]] <- current.sp.list
+  }
+  
+  # Initialize the iterating through sp combinations list
+  for (k in 1:length(overall.sp.list)){
+  
+  # Empty variables for storing output
+  fit_gamma <- NULL
+  best.fit <- NULL
+  
+  # Index the current list of species
+  current.sp.list <- overall.sp.list[[k]]
+  
+  # Filter the chemical SSD data by the species that match
+  chemical.sp.data <- IndividualSSDs %>%
+    filter(Species %in% current.sp.list)
+  
+  # Filter the species that are left out and save into the data
+  sp.left.out <- IndividualSSDs %>%
+    dplyr::select(Species) %>%
+    filter(!Species %in% chemical.sp.data$Species)
+  sp.left.out <- sp.left.out[1,1]
+  output.list <- chemical.sp.data
+  output.list$Sp.left.out <- sp.left.out
+
+  # Calculate the geomeans and metrics needed to create the SSD (same as single-chemical SSD)
+  IndividualSSDs.2 <- output.list %>%
+    group_by(Species) %>%
+    summarise(
+      average = geoMean(Conc), 
+      minimum = min(Conc),
+      sd = sd(Conc),
+      n = n(),
+      Chemical = Chemical,
+      Sp.left.out = Sp.left.out)
+
+  
+  IndividualSSDs.2 <- unique(IndividualSSDs.2) #Adding toxicity data for each chemical to a list and making sure there are no duplicates
+  
+  # Create intermediate data frame
+  Newdf <- IndividualSSDs.2
+  
+  #Calculating the probability points for each species 
+  df <- Newdf[order(Newdf$average),]
+  df$frac <- ppoints(df$average, 0.5)
+  df
+ 
+     
+  #Fit a distribution to the plotted points - there might be errors here so have built in de-bugging
+  fit_llogis <- try(fitdist(df$average, "llogis"), silent = TRUE) # there might be an error, see if there is
+  fit_lnorm <- try(fitdist(df$average, "lnorm"), silent = TRUE) # there might be an error, see if there is
+  fit_gamma <- try(fitdist(df$average, "gamma"), silent = TRUE) # there might be an error, see if there is
+  fit_weibull <- try(fitdist(df$average, "weibull"), silent = TRUE) # there might be an error, see if there is
+
+  # If there is an error in all 4 cases, return that there is an error.
+  if("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull) & "try-error" %in% class(fit_lnorm)){
+    
+    # Paste that there is an error with all 4
+    paste("there is an error with all 4 distributions")
+
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull)){
+    
+    # If there is error with gamma, llogis, and weibull, only do lognormal
+    ln <- gofstat(fit_lnorm)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8]))
+    best.fit.table <- data.table(c("lnorm"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_lnorm)){
+    
+    # If there is error with gamma, llogis, and lnorm, only do weibull
+    w <- gofstat(fit_weibull)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(w[8]))
+    best.fit.table <- data.table(c("weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_weibull) & "try-error" %in% class(fit_lnorm)){
+    
+    # If there is error with gamma, weibull, and lnorm, only do llogis
+    ll <- gofstat(fit_llogis)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8]))
+    best.fit.table <- data.table(c("llogis"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull) & "try-error" %in% class(fit_lnorm)){
+    
+    # If there is error with llogis, weibull, and lnorm, only do gamma
+    g <- gofstat(fit_gamma)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(g[8]))
+    best.fit.table <- data.table(c("gamma"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis)){
+    
+    # if error with gamma and llogis, try lnorm first
+    ln <- gofstat(fit_lnorm)
+    
+    # try to also fit weibull
+    w <- try(gofstat(fit_weibull), silent = TRUE)
+    if ("try-error" %in% class(w)){
+      
+      #only do lnorm
+      ln <- gofstat(fit_lnorm)
+      # fit distribution to data
+      a <- unlist(c(ln[8]))
+      best.fit.table <- data.table(c("lnorm"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8], w[8]))
+    best.fit.table <- data.table(c("lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_weibull)){
+    
+    # if error with gamma and weibull, try lnorm first
+    ln <- gofstat(fit_lnorm)
+    
+    # try to also fit llogis
+    ll <- try(gofstat(fit_llogis), silent = TRUE)
+    if ("try-error" %in% class(ll)){
+      #only do lnorm
+      ln <- gofstat(fit_lnorm)
+      # fit distribution to data
+      a <- unlist(c(ln[8]))
+      best.fit.table <- data.table(c("lnorm"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8], ll[8]))
+    best.fit.table <- data.table(c("lnorm", "llogis"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_lnorm)){
+    
+    # if error with gamma and lnorm, try weibull first
+    w <- gofstat(fit_weibull)
+    
+    # try fit llogis
+    ll <- try(gofstat(fit_llogis), silent = TRUE)
+    if ("try-error" %in% class(ll)){
+      #only do weibull
+      w <- gofstat(fit_weibull)
+      # fit distribution to data
+      a <- unlist(c(w[8]))
+      best.fit.table <- data.table(c("weibull"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(w[8], ll[8]))
+    best.fit.table <- data.table(c("weibull", "llogis"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull)){
+    
+    # if error with llogis and weibull, try lnorm first
+    ln <- gofstat(fit_lnorm)
+    
+    # try fit gamma
+    g <- try(gofstat(fit_gamma), silent = TRUE)
+    if ("try-error" %in% class(g)){
+      #only do lnorm
+      ln <- gofstat(fit_lnorm)
+      # fit distribution to data
+      a <- unlist(c(ln[8]))
+      best.fit.table <- data.table(c("lnorm"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8], g[8]))
+    best.fit.table <- data.table(c("lnorm", "gamma"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_lnorm)){
+    # if error in gamma and lnorm, try the other two
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_llogis)) {
+    
+    # if error in just llogis
+    g <- gofstat(fit_gamma)
+    ln <- gofstat(fit_lnorm)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(g[8], ln[8], w[8]))
+    best.fit.table <- data.table(c("gamma", "lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma)) {
+    
+    # if error in just gamma
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_weibull)) {
+    
+    # if error in just weibull
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    g <- gofstat(fit_gamma)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], g[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "gamma"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_lnorm)) {
+    
+    # if error in just lnorm
+    ll <- gofstat(fit_llogis)
+    g <- gofstat(fit_gamma)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], g[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "gamma", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else {
+    
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    g <- gofstat(fit_gamma)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], g[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "gamma", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  }
+  
+  #Calculate the best fit distribution
+  best.fit <- fitdist(df$average, b)
+  
+  # Extract the estimated HC5 value
+  hc5 <- quantile(best.fit, probs = 0.05)
+  Estimated_HC5 <- hc5$quantiles$`p=0.05`
+  
+  # Bootstrap the HC5 value with upper and lower CIs
+  fit_boot <- bootdist(best.fit, bootmethod = 'param', niter = 1000)
+  
+  # This step is not necessary I am just using it to check the bootstrap is working
+  bootstrap_hc5 <- quantile(fit_boot, probs = 0.05)
+  
+  # Save boostrapped HC5 and CIs
+  Bootstrapped_HC5 <- bootstrap_hc5$quantiles$`p=0.05`
+  HC5_lower_ci <- bootstrap_hc5$quantCI[1,1]
+  HC5_upper_ci <- bootstrap_hc5$quantCI[2,1]
+  
+  # Save the identifying variables
+  Chem.ID <- unique(df$Chemical)
+  Species.left.out <- unique(df$Sp.left.out)
+  
+  # Save the HC5 values
+  hc5.table <- data.frame(i, k, Estimated_HC5, Bootstrapped_HC5, HC5_lower_ci, HC5_upper_ci, b, m, Species.left.out)
+  
+  # Save each line as a spot in the HC5 list
+  individual.hc5s.for.chem[[k]] <- hc5.table
+  
+  }
+  
+  # Combine all the elements of the list together (don't overwrite)
+  individual.hc5s.for.chem.1 <- rbindlist(individual.hc5s.for.chem)
+  
+  # Then save each all the runs for a single chemical together as a space in a list
+  individual.hc5s[[i]] <- individual.hc5s.for.chem.1
+  
+}
+
+# Finally, combine data from all chemicals together
+individual.hc5s.LOO <- rbindlist(individual.hc5s)
+```
+
+
+### Check LOO loop output and clean up data
+Quickly check the work we did to see it works
+```{r}
+# First check for duplicates (the loop may have ran through an extra time)
+individual.hc5s.LOO <- unique(individual.hc5s.LOO)
+
+# Change column names to match the other HC5 output
+colnames(individual.hc5s.LOO) <- c("Chemical", "Iteration", "SSD Estimated HC5", "SSD Bootstrapped HC5", "HC5 Lower CI", "HC5 Upper CI", "SSD Dist.", "SSD AD", "Species Left Out")
+```
+
+We have calculated the single-chem HC5s, the single-chem LOO HC5s, and now we can move on to the SSDn HC5s.
+
+# 4. Build normalized SSDs and extract the HC5n/HC5 values
+Using this method, we will create the maximum number of SSDns possible, by first creating the maximum number of combinations of chemicals and by using all possible nSpecies within each combination.
+
+### Initialize relevant variables before loop
+```{r}
+# Create a list of the organophosphate chemicals we are using
+list.OPs <- c("Chlorpyrifos", "Diazinon", "Dichlorvos", "Fenitrothion", "Fenthion", "Malathion", "Methyl parathion", "Naled", "Parathion", "Trichlorfon")
+
+#Creates a list of different random draws from the 10 chemicals; each is for a different number of chemicals being drawn (m), and each draws the number of times (n) without repetition. Assigns the data.tables of these different chemical combinations to a variable called "chem.list.OP"
+chem.list.OP <- list(
+  data.table(comboSample(list.OPs, m = 2, n = 45, repetition = FALSE)), # 10 choose 2
+  data.table(comboSample(list.OPs, m = 3, n = 120, repetition = FALSE)), # 10 choose 3
+  data.table(comboSample(list.OPs, m = 4, n = 210, repetition = FALSE)), # 10 choose 4
+  data.table(comboSample(list.OPs, m = 5, n = 252, repetition = FALSE)), # 10 choose 5
+  data.table(comboSample(list.OPs, m = 6, n = 210, repetition = FALSE)), # 10 choose 6 
+  data.table(comboSample(list.OPs, m = 7, n = 120, repetition = FALSE)), # 10 choose 7 
+  data.table(comboSample(list.OPs, m = 8, n = 45, repetition = FALSE)), # 10 choose 8 
+  data.table(comboSample(list.OPs, m = 9, n = 10, repetition = FALSE)), # 10 choose 9 
+  data.table(comboSample(list.OPs, m = 10, n = 1, repetition = FALSE))) # 10 choose 10 
+
+#check
+chem.list.OP[[1]]
+```
+
+
+### Initialize the loop - using chem.list.OP
+```{r}
+# Initialize the data vectors - these are empty lists that will store the outputs of the loop so we can combine them later
+statvec <- c()
+numbers <- c()
+Compounds <- list()
+List.Statsdf <- list()
+List.Compounds <- list()
+
+# This loop iterates through the groupings of chemicals: in this case, we have our list of organophosphates with 9 different groupings (2 chems, 3 chems, 4 chems, 5 chems...10 chems).
+for (y in 1:9) {
+  
+  current.chem.list <- chem.list.OP[[y]] # index the current chemicals
+  Statsdf <- list() # make a list to hold the outputs
+  xlength <- length(current.chem.list$V1) # finds how many different groups there are within that group (ie there are 10 pairs of 2 chems)
+
+# This next loop is nested within the first loop. It takes the chemicals within the group we are looking at, makes a data frame matching those chemicals
+for (x in 1:xlength) {
+  
+  OP.chemicals <- current.chem.list[x]
+  
+#Making a dataframe using only chemicals with the same MOA, for a single water type
+OP.data <- data %>%
+  filter(Chemical %in% OP.chemicals)
+
+#Select species from each compound of interest
+ListByChemical <- list()
+
+# This loop iterates through each chemical in our list.
+for (Chemical_ in OP.chemicals){
+  
+  # Set the current chemical to the chemical of interest
+  CurrentCompound <- Chemical_
+  
+  # Filter the species to include only species from the current compound of all the species in the data set
+  CurrentCompoundSpecies <- OP.data %>%
+    filter(Chemical == CurrentCompound & Species %in% data$Species)
+  
+  #Makes a list of species but each species is only represented one time
+  SingleList<- unique(CurrentCompoundSpecies$Species)
+  
+  #This assigns the newly made vector of species for a chemical to the next item of the list. The double bracket [[i]] is the index number of where it is located in that list.
+  ListByChemical[[Chemical_]] <- SingleList
+  
+}
+
+# Create a vector of species that are shared across all chemicals (ie our nSpecies pool)
+xspecies <- Reduce(intersect, ListByChemical)
+
+# The next loop iterates through this nSpecies pool and sets each as the normalization species, so it can be used to calculate the LC50n values
+
+# initialize list for holding data
+byspecies.df <- list()
+
+for(xspecies_ in xspecies){
+
+  # Set the normalization species
+  commonspecies <- xspecies_ 
+  
+  # Create a data frame of toxicity data for just the normalization species (eg only daphnia magna, for example)
+  ToxSensitive <- OP.data %>%
+    filter(Species == commonspecies)
+
+  # Calculate the geometric mean of the nSpecies toxicity (also called the SMAV of the nSpecies)
+  ToxSensitive <- ToxSensitive %>%
+    group_by(Chemical) %>% # group by each chemical
+    summarise(
+    average = geoMean(Conc)) #SMAV of the nSpecies
+
+# We now have the nSpecies SMAVs calculated for each chemical. The next loop will calculate LC50n values for one chemical group at a time. It will assign them to a list of data frames. To calculate LC50n values you divide the LC50 by the nSpecies SMAV
+# LC50n values are calculated by dividing the LC50 by the normalizing species 
+
+# Set up empty lists for holding data
+df.bf <- list()
+chem.no.spec <- list()
+
+# This loop iterates through each chemical - for each chemical in the list of organophosphate:
+for(Chemical_ in OP.chemicals){
+  
+  # Filter the data for only that chemical
+  ICE1 <- OP.data %>%
+    filter(Chemical == Chemical_)
+  
+  # Save the nSpecies SMAV for that chemical as the average value
+  avgval <- ToxSensitive$average[ToxSensitive$Chemical == Chemical_]
+  
+  # Calculate the SMAV for each species for a SINGLE chemical
+  ICE2 <- ICE1 %>%
+    group_by(Species) %>% # group by species to account for multiple observations
+    summarise(
+      SMAV = geoMean(Conc), # Calculate the SMAV for each species for a single chemical
+      Genus = Genus
+    ) %>%
+    mutate(SMAV.norm = SMAV/avgval) # Normalize SMAVs for each species for a single chemical using the average value of the nSpecies
+  
+  # Remove duplicate values
+  ICE2 <- unique(ICE2)
+  
+  # Save the results into the individual chemical's list
+  df.bf[[Chemical_]] <- ICE2
+  
+  # Order the species for this chemical by the SMAV
+  df.nSpecies <- ICE2[order(ICE2$SMAV.norm),]
+  
+  # Find the cumulative probability of each species SMAV (as you would in a regular SSD)
+  df.nSpecies$P <- ppoints(df.nSpecies$SMAV.norm, 0.5)
+  
+  # Find the cumulative probability of the nSpecies for that chemical
+  nSpecies.P.chem <- df.nSpecies$P[df.nSpecies$Species == commonspecies]
+  
+  # Save that into a data frame
+  data.frame(nSpecies.P.chem)
+  
+  # Save all of this data into the list
+  chem.no.spec[[Chemical_]] <- data.table(Chemical_, length(ICE2$SMAV.norm), length(unique(ICE2$Genus)), nSpecies.P.chem)
+  
+}
+
+# These tables combine all the separate tables with LC50n values
+Newdf.bf <- rbindlist(df.bf)
+chem.no.spec <- rbindlist(chem.no.spec)
+colnames(chem.no.spec) <- c("Chemical", "no.species", "no.genera", "nSpecies.P.chem")
+chem.no.spec <- chem.no.spec %>%
+  mutate(nSpecies.P.chem.SEM = std.error(nSpecies.P.chem))
+tot.data <- length(Newdf.bf$Species)
+
+
+# We now have all the LC50n values for all species and all chemicals
+
+
+# This next section of the loop creates the SSDn using the LC50n values for all of the compounds
+
+# Derive the geometric mean of normalized SMAVs across all chemicals
+Newdf.bf <- Newdf.bf %>%
+  group_by(Species) %>%
+  summarise(
+    SMAV.norm = geoMean(SMAV.norm), # geometric mean of normalized SMAV
+    Genus = Genus,
+    n = n())
+
+# Remove any duplicates
+Newdf.bf <- unique(Newdf.bf)
+
+# Order by normalized SMAV and find cumulative probability
+df <- Newdf.bf[order(Newdf.bf$SMAV.norm),]
+df$frac <- ppoints(Newdf.bf$SMAV.norm, 0.5)
+
+# Make it a data table
+df <- data.table(df)
+
+#Fit a distribution to the plotted points - there might be errors here so have built in de-bugging
+fit_llogis <- try(fitdist(df$SMAV.norm, "llogis"), silent = TRUE) # there might be an error, see if there is
+fit_lnorm <- try(fitdist(df$SMAV.norm, "lnorm"), silent = TRUE) # there might be an error, see if there is
+fit_gamma <- try(fitdist(df$SMAV.norm, "gamma"), silent = TRUE) # there might be an error, see if there is
+fit_weibull <- try(fitdist(df$SMAV.norm, "weibull"), silent = TRUE) # there might be an error, see if there is
+
+  # If there is an error in all 4 cases, return that there is an error.
+if("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull) & "try-error" %in% class(fit_lnorm)){
+    
+    # Paste that there is an error with all 4
+    print(paste("there is an error with all 4 distributions"))
+
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull)){
+    
+    # If there is error with gamma, llogis, and weibull, only do lognormal
+    ln <- gofstat(fit_lnorm)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8]))
+    best.fit.table <- data.table(c("lnorm"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_lnorm)){
+    
+    # If there is error with gamma, llogis, and lnorm, only do weibull
+    w <- gofstat(fit_weibull)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(w[8]))
+    best.fit.table <- data.table(c("weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_weibull) & "try-error" %in% class(fit_lnorm)){
+    
+    # If there is error with gamma, weibull, and lnorm, only do llogis
+    ll <- gofstat(fit_llogis)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8]))
+    best.fit.table <- data.table(c("llogis"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull) & "try-error" %in% class(fit_lnorm)){
+    
+    # If there is error with llogis, weibull, and lnorm, only do gamma
+    g <- gofstat(fit_gamma)
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(g[8]))
+    best.fit.table <- data.table(c("gamma"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_llogis)){
+    
+    # if error with gamma and llogis, try lnorm first
+    ln <- gofstat(fit_lnorm)
+    
+    # try to also fit weibull
+    w <- try(gofstat(fit_weibull), silent = TRUE)
+    if ("try-error" %in% class(w)){
+      
+      #only do lnorm
+      ln <- gofstat(fit_lnorm)
+      # fit distribution to data
+      a <- unlist(c(ln[8]))
+      best.fit.table <- data.table(c("lnorm"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8], w[8]))
+    best.fit.table <- data.table(c("lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_weibull)){
+    
+    # if error with gamma and weibull, try lnorm first
+    ln <- gofstat(fit_lnorm)
+    
+    # try to also fit llogis
+    ll <- try(gofstat(fit_llogis), silent = TRUE)
+    if ("try-error" %in% class(ll)){
+      #only do lnorm
+      ln <- gofstat(fit_lnorm)
+      # fit distribution to data
+      a <- unlist(c(ln[8]))
+      best.fit.table <- data.table(c("lnorm"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8], ll[8]))
+    best.fit.table <- data.table(c("lnorm", "llogis"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_lnorm)){
+    
+    # if error with gamma and lnorm, try weibull first
+    w <- gofstat(fit_weibull)
+    
+    # try fit llogis
+    ll <- try(gofstat(fit_llogis), silent = TRUE)
+    if ("try-error" %in% class(ll)){
+      #only do weibull
+      w <- gofstat(fit_weibull)
+      # fit distribution to data
+      a <- unlist(c(w[8]))
+      best.fit.table <- data.table(c("weibull"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(w[8], ll[8]))
+    best.fit.table <- data.table(c("weibull", "llogis"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_llogis) & "try-error" %in% class(fit_weibull)){
+    
+    # if error with llogis and weibull, try lnorm first
+    ln <- gofstat(fit_lnorm)
+    
+    # try fit gamma
+    g <- try(gofstat(fit_gamma), silent = TRUE)
+    if ("try-error" %in% class(g)){
+      #only do lnorm
+      ln <- gofstat(fit_lnorm)
+      # fit distribution to data
+      a <- unlist(c(ln[8]))
+      best.fit.table <- data.table(c("lnorm"), a)
+      m <- min(a)
+      b <- best.fit.table$V1[best.fit.table$a == m]
+    }
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ln[8], g[8]))
+    best.fit.table <- data.table(c("lnorm", "gamma"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma) & "try-error" %in% class(fit_lnorm)){
+    # if error in gamma and lnorm, try the other two
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_llogis)) {
+    
+    # if error in just llogis
+    g <- gofstat(fit_gamma)
+    ln <- gofstat(fit_lnorm)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(g[8], ln[8], w[8]))
+    best.fit.table <- data.table(c("gamma", "lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_gamma)) {
+    
+    # if error in just gamma
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_weibull)) {
+    
+    # if error in just weibull
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    g <- gofstat(fit_gamma)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], g[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "gamma"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else if ("try-error" %in% class(fit_lnorm)) {
+    
+    # if error in just lnorm
+    ll <- gofstat(fit_llogis)
+    g <- gofstat(fit_gamma)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], g[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "gamma", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  } else {
+    
+    ll <- gofstat(fit_llogis)
+    ln <- gofstat(fit_lnorm)
+    g <- gofstat(fit_gamma)
+    w <- gofstat(fit_weibull)
+    
+    #Fit the best distribution to the data; identify it by the lowest anderson darling statistic
+    a <- unlist(c(ll[8], ln[8], g[8], w[8]))
+    best.fit.table <- data.table(c("llogis", "lnorm", "gamma", "weibull"), a)
+    m <- min(a)
+    b <- best.fit.table$V1[best.fit.table$a == m]
+    
+  }
+
+# Calculate the best fit distribution
+best.fit <- fitdist(df$SMAV.norm, b)
+
+# Save the distribution parameters
+params <- names(best.fit[[1]])
+params.no <- best.fit[[1]]
+param1 <- params[1]
+param2 <- params[2]
+param1.no <- params.no[1]
+param2.no <- params.no[2]
+
+# List of the distribution parameters SDs
+params.sd <- best.fit[[3]]
+param1.sd <- params.sd[1]
+param2.sd <- params.sd[2]
+
+# Calculate a normalized hc5 value with a bootstrap
+hc5n <- quantile(best.fit, probs = 0.05)
+hc5n <- hc5n$quantiles$`p=0.05`
+
+# Combine all the data from a single run together
+data.table(ToxSensitive)
+data.table(chem.no.spec)
+
+# Create a joint data frame with the following variables
+jointdf <- full_join(ToxSensitive, chem.no.spec, by = "Chemical")
+jointdf$iteration <- x # save which iteration it was calculated on
+jointdf$bf.HC5n <- hc5n # the hc5n of the SSDn
+jointdf$bf.HC5 <- jointdf$average * hc5n #the chemical specific HC5 using the best fit distribution 
+jointdf$no.chems <- length(ToxSensitive$Chemical) # number of chemicals used to make the SSDn
+jointdf$dist <- b #type of distribution
+jointdf$param1 <- param1 # model parameters
+jointdf$param1.no <- param1.no # model parameters
+jointdf$param1.sd <- param1.sd # model parameters
+jointdf$param2 <- param2 # model parameters
+jointdf$param2.no <- param2.no # model parameters
+jointdf$param2.sd <- param2.sd # model parameters
+jointdf$tot.data <- tot.data # total number of SMAVs contributed to the SSDn
+jointdf$AIC <- m # Anderson darling stat for the SSDn best fit distribution
+jointdf$nSpecies.P.SSDn <- df$frac[df$Species == commonspecies] # cumulative probability of the nSpecies in the SSDn
+jointdf$nSpecies <- commonspecies # which nSpecies used in this iteration
+jointdf$tot.species <- length(df$Species)# How many species in the SSDn
+jointdf$tot.genera <- length(unique(df$Genus)) #How many genera in the SSDn
+
+# index this data to which species made the SSDn
+byspecies.df[[xspecies_]] <- jointdf
+
+}
+
+Statsdf[[x]] <- rbindlist(byspecies.df)
+Statsdf
+
+
+}
+  List.Statsdf[[y]] <- rbindlist(Statsdf) #Add to the overall output dataframe list for each run with diff. no. of chems
+}
+
+# Save this before we over write it
+List.Statsdf.combo <- rbindlist(List.Statsdf)
+```
+
+
+
+The "List.Statsdf.combo" is the raw output of all the SSDns we created using the loop. Before moving on to further analyses, it will be helpful to calculate relevant statistics and variables.
+
+### Calculate means, SDs, SEs, and 95% CIs for the nSpecies and overall
+There should be the HC5 for each species, and the overall chemical HC5 which is calculated by averaging all of the HC5s for the species for a single chemical. 
+
+We are interested in the overall chemical mean rather than the nSpecies means as some species have a lot more data than others; if we only used each value to calculate the overall mean, we would weight the results to the species with more data - which we do not want to do.
+```{r}
+# First, calculate the means, standard deviations, standard errors, and 95% confidence intervals around the nSpecies mean and overall chemical mean
+Final.Data <- List.Statsdf.combo %>%
+  dplyr::group_by(Chemical, nSpecies) %>% # first group by chemical then group by the nSpecies
+  mutate(
+    nspecies.mean.HC5 = mean(bf.HC5)) %>% # Calculate the mean HC5 for that nSpecies
+  dplyr::ungroup() %>% # ungroup
+  dplyr::group_by(Chemical) %>% # group by chemical
+  mutate(
+    chemical.mean.HC5 = mean(nspecies.mean.HC5), # calculate the overall average HC5 for that chemical (take the mean of a mean)
+    chemical.sd.HC5 = sd(nspecies.mean.HC5), # calculate overall SD for each chemical
+    no.obs.length = length(unique(nSpecies)), # calculate how many nSpecies were used for each chemical
+    chemical.std.err.HC5 = (chemical.sd.HC5 / sqrt(no.obs.length)), # calculate standard error by dividing the SD by the square root of the sample size - in this case, how many nspecies there are 
+    upper.CI = (chemical.mean.HC5 + 1.96*chemical.std.err.HC5), # calculate upper 95% CI
+    lower.CI = (chemical.mean.HC5 - 1.96*chemical.std.err.HC5), # calculate lower 95% CI
+    upper.SD.limit = (chemical.mean.HC5 + chemical.sd.HC5), # calculate mean + 1 SD
+    lower.SD.limit = (chemical.mean.HC5 - chemical.sd.HC5)) %>% # mean - 1 SD
+  dplyr::ungroup() # ungroup chemical so data is back how it was
+```
+
+### Add the single chemical HC5s to the final dataset
+Add the single chemical HC5s (true HC5s) to the data - this is helpful for a few of the plots
+```{r}
+# Extract the chemical specific HC5s
+single.hc5.table <- single.individual.HC5s %>%
+  dplyr::select(Chemical, `SSD Estimated HC5`)
+  
+# Rename the columns so I can join to the full dataset
+colnames(single.hc5.table) <- c("Chemical", "Single.C.HC5.bf")
+
+# Join to full data set
+Final.Data <- left_join(Final.Data, single.hc5.table, by = "Chemical")
+```
+
+### Add the nSpecies taxa for easier plotting
+For this particular script, since we used all species, I am going to add in the taxa to for plotting
+```{r}
+# Create a list of the taxa and nspecies
+taxa <- data %>%
+  dplyr::select(
+    Species, Taxa
+  )
+
+# Rename column names to join easier
+colnames(taxa) <- c("nSpecies", "nSpecies.Taxa")
+
+# Only use the unique species so there are no repeats
+taxa <- unique(taxa)
+
+# Join to the main data set
+Final.Data <- left_join(Final.Data, taxa)
+```
+We have added all relevant data and variables to our final dataset, which we can now use to make plots. 
+
+# 5. Summarize and prepare plotting data
+
+### Prepare LOO vs SSDn comparison data
+The steps in this code chunk are pretty bulky, but what I am trying to do here with the wide vs long data is two things. First, by making the data into wide data I can export it cleanly as a table, which can go straight into the manuscript. The long data is needed specifically for plotting.
+```{r}
+### Generate the LOO plotting data
+LOO.plotting.data.wide <- individual.hc5s.LOO %>%
+  dplyr::select(Chemical, Iteration, `SSD Estimated HC5`) %>% # select only these columns
+  dplyr::group_by(Chemical) %>% # group by chemical
+  mutate(
+    LOO.mean.HC5 = mean(`SSD Estimated HC5`), # calculate mean
+    LOO.SD.HC5 = sd(`SSD Estimated HC5`), # calculate SD
+    LOO.std.err = LOO.SD.HC5 / sqrt(length(Iteration)), # calculate standard error
+    LOO.upper.CI = (LOO.mean.HC5 + 1.96*LOO.std.err), # calculate upper CI
+    LOO.lower.CI = (LOO.mean.HC5 - 1.96*LOO.std.err), # calculate lower CI
+    LOO.SD.upper = (LOO.mean.HC5 + LOO.SD.HC5), # calculate mean + SD
+    LOO.SD.lower = (LOO.mean.HC5 - LOO.SD.HC5)) %>% # calculate mean - SD
+  ungroup() # ungroup to revert data back to how it was
+
+# Select only the mean/sd/se/ci columns
+LOO.plotting.data.wide <- LOO.plotting.data.wide[ ,c(1,4:10)]
+# Remove duplicates
+LOO.plotting.data.wide <- unique(LOO.plotting.data.wide)
+
+# Now we have a nice summary table of the HC5 data using the LOO method
+
+### Clean the SSDn plotting data
+SSDn.plotting.data.wide <- Final.Data %>%
+  dplyr::select(
+    Chemical, chemical.mean.HC5, chemical.sd.HC5, chemical.std.err.HC5, upper.CI, lower.CI, upper.SD.limit, lower.SD.limit) %>%
+  unique()
+
+# Same with the SSDn method
+
+# Combine the two together so we can convert to long format
+combined.plot.data <- left_join(LOO.plotting.data.wide, SSDn.plotting.data.wide)
+
+# First extract just the means and convert to long format
+long.data.means <- combined.plot.data %>%
+  dplyr::select(Chemical, LOO.mean.HC5, chemical.mean.HC5) %>% # select only the chemical and two mean variables
+  pivot_longer(cols = c("LOO.mean.HC5", "chemical.mean.HC5"), # pivot longer 
+               names_to = "Method",
+               values_to = "HC5.Mean.Estimate")
+# Rename the method to LOO vs SSDn
+long.data.means[long.data.means == "LOO.mean.HC5"] <- "LOO"
+long.data.means[long.data.means == "chemical.mean.HC5"] <- "SSDn"
+
+# Now do same for SDs
+long.data.SDs <- combined.plot.data %>%
+  dplyr::select(Chemical, LOO.SD.HC5, chemical.sd.HC5)%>%
+  pivot_longer(cols = c("LOO.SD.HC5", "chemical.sd.HC5"),
+               names_to = "Method",
+               values_to = "HC5.SD.Estimate")
+# Rename the method to LOO vs SSDn
+long.data.SDs[long.data.SDs == "LOO.SD.HC5"] <- "LOO"
+long.data.SDs[long.data.SDs == "chemical.sd.HC5"] <- "SSDn"
+
+# Now do same for standard errors
+long.data.SEs <- combined.plot.data %>%
+  dplyr::select(Chemical, LOO.std.err, chemical.std.err.HC5)%>%
+  pivot_longer(cols = c("LOO.std.err", "chemical.std.err.HC5"),
+               names_to = "Method",
+               values_to = "HC5.Std.Err.Estimate")
+# Rename the method to LOO vs SSDn
+long.data.SEs[long.data.SEs == "LOO.std.err"] <- "LOO"
+long.data.SEs[long.data.SEs == "chemical.std.err.HC5"] <- "SSDn"
+
+# Combine together
+long.data.total <- left_join(long.data.means, long.data.SDs)
+long.data.total <- left_join(long.data.total, long.data.SEs)
+
+# add in upper and lower CIs
+long.data.total <- long.data.total %>%
+  dplyr::mutate(
+    HC5.Upper.CI = HC5.Mean.Estimate + 1.96*HC5.Std.Err.Estimate,
+    HC5.Lower.CI = HC5.Mean.Estimate - 1.96*HC5.Std.Err.Estimate)
+```
+
+
+
+## Add in single chem SSD upper and lower CI to long data total
+We want to compare the CIs for all three methods. For the conventional SSD method, we are using the upper and lower confidence interval of the best-fit distribution.
+```{r}
+###
+single.individual.HC5s
+single.ssd.long <- single.individual.HC5s %>%
+  dplyr::select(Chemical, `SSD Estimated HC5`, `HC5 Lower CI`, `HC5 Upper CI`)
+
+## add in relevant columns
+single.ssd.long$Method <- "SSD"
+single.ssd.long$HC5.SD.Estimate <- NA
+single.ssd.long$HC5.Std.Err.Estimate <- NA
+
+# re order the columns
+single.ssd.long <- single.ssd.long[, c(1,5,2,6,7,4,3)] # leave the row index blank to keep all rows
+
+# rename columns
+colnames(single.ssd.long)[3] <- "HC5.Mean.Estimate"
+colnames(single.ssd.long)[6] <- "HC5.Upper.CI"
+colnames(single.ssd.long)[7] <- "HC5.Lower.CI"
+
+long.data.total <- rbind(long.data.total, single.ssd.long)
+```
+
+
+# Extract relevant data on accuracy for manuscript
+```{r}
+### Extract relevant data for manuscript
+#I want to compare the output of the single-chemical HC5s and the LOO HC5s.
+
+
+# Calculate fold difference between them. Fold difference is given as (Y/X - 1) where Y is the final value and X is the starting value
+
+### Chlorpyrifos fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Chlorpyrifos"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Chlorpyrifos" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Chlorpyrifos" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Chlorpyrifos"] - 1
+
+### Diazinon fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Diazinon"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Diazinon" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Diazinon" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Diazinon"] - 1
+
+### Dichlorvos fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Dichlorvos"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Dichlorvos" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Dichlorvos" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Dichlorvos"] - 1
+
+### Fenitrothion fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Fenitrothion"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Fenitrothion" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Fenitrothion" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Fenitrothion"] - 1
+
+### Fenthion fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Fenthion"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Fenthion" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Fenthion" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Fenthion"] - 1
+
+### Malathion fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Malathion"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Malathion" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Malathion" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Malathion"] - 1
+
+### Methyl Parathion fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Methyl parathion"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Methyl parathion" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Methyl parathion" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Methyl parathion"] - 1
+
+### Naled fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Naled"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Naled" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Naled" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Naled"] - 1
+
+### Parathion fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Parathion"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Parathion" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Parathion" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Parathion"] - 1
+
+### Trichlorfon fold difference
+single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Trichlorfon"]/ long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Trichlorfon" & long.data.total$Method == "LOO"] - 1
+long.data.total$HC5.Mean.Estimate[long.data.total$Chemical == "Trichlorfon" & long.data.total$Method == "LOO"] / single.individual.HC5s$`SSD Estimated HC5`[single.individual.HC5s$Chemical == "Trichlorfon"] - 1
+```
+
+
+That is done - now calculate uncertainty and accuracy
+
+# 6. Calculate uncertainty and accuracy
+
+
+I am going to calculate fold-difference as the primary measure of accuracy (as in fold increase or decrease) and a ratio of the upper confidence interval to the estimate as a measure of uncertainty.
+
+
+### Create a function for calculating the absolute value of fold-difference
+```{r}
+# Create the function. The fold difference gives the absolute value of the maximum of the two numbers being compared. If you want to look for directionality to determine if one value is lower than the other, then also compute the actual difference as chemA/chemB and just remember which one is your numerator and which is your denominator. I always calculate an “actual difference” every time I work with fold difference to ensure there isn’t a bias in over or under-estimation.
+fold.diff <- function(prediction, actual) {
+  return(max(prediction/actual, actual/prediction))
+}
+
+## test
+fold.diff(10, 20)
+fold.diff(20, 10)
+
+# So what is happening here is we are simply getting the absolute value of the fold difference, which makes sense for our plots. IE going from 20 to 10 is a 2-fold decrease, and going from 10 to 20 is a 2-fold increase. Similarly, going from 5 to 10 is also a 2-fold increase, and 10 to 5 is a 2-fold decrease.
+```
+
+
+### Add in the single-chemical SSD HC5s to the long-data total dataset
+```{r}
+# Select the chemical and the single chemical HC5 columns and save as new dataframe
+SSD.HC5s <- single.individual.HC5s %>%
+  dplyr::select(Chemical, `SSD Estimated HC5`)
+
+# Join them to the metric data frame
+metric.data <- left_join(long.data.total, SSD.HC5s)
+
+# Rename column names
+colnames(metric.data)[8] <- "Single.SSD.HC5"
+```
+
+We developed two metrics (accuracy and uncertainty) to determine what, if any, factors were driving the relatively poor predictions seen in Dichlorvos and Naled in the Organophosphate Invertebrate data set. The accuracy metric we created is a measure of fold-change, and measures how far away the LOO and SSDn-derived HC5 values are from the conventional single-chemical SSD-derived HC5 values. In the accuracy metric, a value of 1 represents the lowest possible value and the most accurate prediction. The further away the accuracy values are from one, the less accurate the prediction is.
+
+
+### Calculate an accuracy metric based on the fold-difference
+```{r}
+# the function does not work for data frames, so we have to apply it using a loop
+
+### Set up a n empty list to hold the accuracy results along with the chemical identifier
+accuracy.list <- list()
+for (i in 1:nrow(metric.data)){
+  Chemical <- metric.data$Chemical[i]
+  Method <- metric.data$Method[i]
+  Accuracy <- fold.diff(metric.data$HC5.Mean.Estimate[i], metric.data$Single.SSD.HC5[i])
+  accuracy.list[[i]] <- data.table(Chemical, Method, Accuracy)
+}
+
+# Make it into a data frame
+accuracy.list <- rbindlist(accuracy.list)
+
+# Join into the accuracy test data frame
+metric.data <- left_join(metric.data, accuracy.list)
+```
+
+
+### Uncertainty metric
+The uncertainty metric we developed is the ratio of the SSDn upper CI to the SSDn HC5 average, given as A/B where A is the SSDn upper CI and B is the SSDn HC5 average.
+In this metric, the closer you get to 1, the more certain you are. And the further away you get from 1, the more uncertain you are.
+```{r}
+### Create a test data frame with the metric
+metric.data <- metric.data %>% # take from metric data
+  dplyr::mutate(
+    Uncertainty = HC5.Upper.CI/HC5.Mean.Estimate) # create the metric
+
+# We have the metric, now we need to add in relevant factors that we think might be affecting uncertainty (so we can run a linear model/regression)
+
+### Add in number of species in original single chemical SSD
+
+# Filter and summarize the data to see which chemicals have the most species
+no.spec.in.SSD.data <- data %>% 
+  dplyr::group_by(Chemical) %>% # group by chemical
+  summarise(
+    number_species = n_distinct(Species)) %>% # calculate number of species
+  arrange(desc(number_species)) # arrange in descending order (most species at top)
+
+### join to uncertainty test data
+metric.data <- left_join(metric.data, no.spec.in.SSD.data)
+
+### Rename column name
+colnames(metric.data)[11] <- "Number.Species.in.SSD"
+
+
+# Now add in the number of nSpecies (take this from the final data)
+### add in number of nSpecies
+no.n.spec <- Final.Data %>%
+  dplyr::group_by(Chemical) %>%
+  summarise(
+    no.n.species = n_distinct(nSpecies)) %>% # calculate number of species
+  arrange(desc(no.n.species)) # arrange in descending order (most species at top)
+
+### Left join this into the uncertainty data
+metric.data <- left_join(metric.data, no.n.spec)
+
+### Rename column name
+colnames(metric.data)[12] <- "Number.nSpecies.in.SSDn"
+```
+
+
+### Add in the range of min-max tox values from single-chemical SSD
+```{r}
+# Range in min-max tox values from single-chemical SSD
+ssd.range <- data %>%
+  dplyr::group_by(Chemical) %>%
+  summarise(
+    Chemical = Chemical,
+    min.SSD.tox.val = min(Conc), # take min tox value
+    max.SSD.tox.val = max(Conc), # take max tox value 
+    min.max.SSD.range = max.SSD.tox.val - min.SSD.tox.val # take difference between them
+  )
+
+# Take only unique values
+ssd.range <- unique(ssd.range)
+
+# Join to metric data set
+metric.data <- left_join(metric.data, ssd.range)
+```
+
+
+
+### Export the metric data as a CVS file so it can be used to create a table
+```{r}
+write.csv(metric.data, "OP_inverts_metric_data.csv")
+```
+
+
+
+# 7. Create plots and figures 
+
+
+### Set up the first plot
+```{r}
+# Make test data frame
+plot.1.data <- long.data.total
+  
+# Filter by only the chemicals I want for this plot
+plot.1.data <- plot.1.data %>%
+  filter(
+    Chemical == "Dichlorvos" | Chemical == "Chlorpyrifos" | Chemical ==  "Parathion" | Chemical == "Fenthion" | Chemical ==  "Diazinon"
+  )
+
+# make method a factor with these levels to match the plot
+plot.1.data$Method <- factor(plot.1.data$Method, levels = c("SSD", "LOO", "SSDn"))
+
+# manually change the factor levels of the chemicals so that it goes in order from smallest HC5 to largest HC5
+plot.1.data$Chemical <- factor(plot.1.data$Chemical, levels = c("Dichlorvos", "Chlorpyrifos", "Parathion","Fenthion", "Diazinon"))
+
+```
+
+
+### Comparison plot including the single-chemical HC5 as well
+This plot has three values, the LOO HC5 mean and CI, the single-chemical HC5, and the SSDn HC5 mean and CI.
+```{r}
+# first make long data a factor so it can be plotted
+plot.1.data$Method <- as.factor(plot.1.data$Method)
+
+
+# set up color palette
+comp.plot.colours <- c(SSD = "#000000", LOO = "#000000", SSDn = "#000000") # color palette (all black)
+comp.plot.shapes <- c(SSD = 17, LOO = 19, SSDn = 15) # shape types
+
+
+# Create a comparison plot
+comp.plot.1 <- plot.1.data %>%
+  ggplot()+
+  aes(x = Chemical, y = HC5.Mean.Estimate, ymin = HC5.Lower.CI, ymax = HC5.Upper.CI, color = Method, shape = Method)+
+  geom_point(size = 2.5, position = position_dodge(width = 1))+ # add in the points, dodge so they don't hit or overlap each other
+  geom_linerange(aes(ymax= HC5.Upper.CI, ymin = pmax(HC5.Lower.CI, 0)), size = 1, position = position_dodge(width = 1))+ # set line ranges as the upper and lower CIs
+  geom_vline(xintercept = 1.5)+ # add in vertical line to separate chemicals
+  geom_vline(xintercept = 2.5)+ # add in vertical line to separate chemicals
+  geom_vline(xintercept = 3.5)+ # add in vertical line to separate chemicals
+  geom_vline(xintercept = 4.5)+ # add in vertical line to separate chemicals
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Dichlorvos
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Dichlorvos
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Dichlorvos
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Dichlorvos"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Dichlorvos
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Chlorpyrifos
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Chlorpyrifos
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Chlorpyrifos
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Chlorpyrifos"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Chlorpyrifos
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Parathion
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Parathion
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Parathion
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Parathion"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Parathion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Fenthion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Fenthion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Fenthion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenthion"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Fenthion
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Diazinon
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Diazinon
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Diazinon
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Diazinon"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Diazinon
+  theme_bw()+ # black and white theme
+  ylab(expression(bold(paste("HC5 (", mu, "g/L)"))))+ # add y axis label
+  scale_y_log10(breaks = c(0.00001, 0.0001, 0.001, 0.01, 0.1, 1), labels = comma)+ # make it a log scale
+  scale_color_manual(values = comp.plot.colours)+ # set colours to the colour palette I chose
+  scale_shape_manual(values = comp.plot.shapes)+ # set shapes to ones i chose
+  scale_x_discrete(expand = c(0, 0.5))+ # cut off the left and right edge of the graph so all boxes are same size
+  theme(axis.text.x = element_text(face = "bold", angle = 45, hjust = 1, size = 13, colour = "black"), # rotate labels 45 degrees for reading, make font 11 point
+        axis.title.x = element_blank(), # remove x axis label
+        axis.title.y = element_text(face = "bold", size = 14, margin = margin(r = 20)),
+        axis.text.y = element_text(face = "bold", size = 13, colour = "black"),
+        legend.text = element_text(face = "bold", size = 13, colour = "black"),
+        legend.title = element_text(face = "bold", size = 13))
+comp.plot.1
+```
+
+
+#### Change the factors for the second plot
+```{r}
+# Make test data frame
+plot.2.data <- long.data.total
+  
+# Filter by the rest of the chemicals
+plot.2.data <- plot.2.data %>%
+  filter(
+    Chemical == "Malathion" | Chemical == "Naled" | Chemical ==  "Fenitrothion" | Chemical == "Methyl parathion" | Chemical ==  "Trichlorfon"
+  )
+
+# make method a factor with these levels to match the plot
+plot.2.data$Method <- factor(plot.2.data$Method, levels = c("SSD", "LOO", "SSDn"))
+
+# manually change the factor levels of the chemicals so that it goes in order from smallest HC5 to largest HC5
+plot.2.data$Chemical <- factor(plot.2.data$Chemical, levels = c("Malathion", "Naled", "Fenitrothion","Methyl parathion", "Trichlorfon"))
+
+```
+
+
+### Comparison plot including the single-chemical HC5 as well
+This plot has three values, the LOO HC5 mean and CI, the single-chemical HC5, and the SSDn HC5 mean and CI.
+```{r}
+# first make long data a factor so it can be plotted
+plot.2.data$Method <- as.factor(plot.2.data$Method)
+
+
+# set up color palette
+comp.plot.colours <- c(SSD = "#000000", LOO = "#000000", SSDn = "#000000") # color palette (all black)
+comp.plot.shapes <- c(SSD = 17, LOO = 19, SSDn = 15) # shape types
+
+
+# Create a comparison plot
+comp.plot.2 <- plot.2.data %>%
+  ggplot()+
+  aes(x = Chemical, y = HC5.Mean.Estimate, ymin = HC5.Lower.CI, ymax = HC5.Upper.CI, color = Method, shape = Method)+
+  geom_point(size = 2.5, position = position_dodge(width = 1))+ # add in the points, dodge so they don't hit or overlap each other
+  geom_linerange(aes(ymax= HC5.Upper.CI, ymin = pmax(HC5.Lower.CI, 0)), size = 1, position = position_dodge(width = 1))+ # set line ranges as the upper and lower CIs
+  geom_vline(xintercept = 1.5)+ # add in vertical line to separate chemicals
+  geom_vline(xintercept = 2.5)+ # add in vertical line to separate chemicals
+  geom_vline(xintercept = 3.5)+ # add in vertical line to separate chemicals
+  geom_vline(xintercept = 4.5)+ # add in vertical line to separate chemicals
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Malathion
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Malathion
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Malathion
+  geom_segment(aes(x = 0.5, xend = 1.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Malathion"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Malathion
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Naled
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Naled
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Naled
+  geom_segment(aes(x = 1.5, xend = 2.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Naled"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Naled
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Fenitrothion
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Fenitrothion
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Fenitrothion
+  geom_segment(aes(x = 2.5, xend = 3.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Fenitrothion"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Fenitrothion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Methyl parathion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Methyl parathion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Methyl parathion
+  geom_segment(aes(x = 3.5, xend = 4.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Methyl parathion"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Methyl parathion
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]*5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]*5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold upper for Trichlorfon
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]/5), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]/5)),
+               colour = "black", linetype = "dashed")+ # add in 5 fold lower for Trichlorfon
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]*3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]*3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold upper for Trichlorfon
+  geom_segment(aes(x = 4.5, xend = 5.5, 
+                   y = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]/3), 
+                   yend = unique(Final.Data$Single.C.HC5.bf[Final.Data$Chemical == "Trichlorfon"]/3)),
+               colour = "black", linetype = "dotted")+ # add in 3 fold lower for Diazinon
+  theme_bw()+ # black and white theme
+  ylab(expression(bold(paste("HC5 (", mu, "g/L)"))))+ # add y axis label
+  scale_y_log10()+
+  scale_color_manual(values = comp.plot.colours)+ # set colours to the colour palette I chose
+  scale_shape_manual(values = comp.plot.shapes)+ # set shapes to ones i chose
+  scale_x_discrete(expand = c(0, 0.5))+ # cut off the left and right edge of the graph so all boxes are same size
+  theme(axis.text.x = element_text(face = "bold", angle = 45, hjust = 1, size = 13, colour = "black"), # rotate labels 45 degrees for reading, make font 11 point
+        axis.title.x = element_blank(), # remove x axis label
+        axis.title.y = element_text(face = "bold", size = 14, margin = margin(r = 20)),
+        axis.text.y = element_text(face = "bold", size = 13, colour = "black"),
+        legend.text = element_text(face = "bold", size = 13, colour = "black"),
+        legend.title = element_text(face = "bold", size = 13))
+comp.plot.2
+```
+
+
+### Combine the results plots and then save
+```{r}
+# Combine the plots into one
+combined.results <- ggarrange(comp.plot.1, comp.plot.2, nrow = 2, ncol = 1, common.legend = TRUE, legend = "right")
+
+# Take a look
+combined.results
+```
+
+# Save the results plot for the manuscript
+```{r}
+# save results plot for manuscript as a tiff file
+tiff("OP_Inverts_Results_FINAL.tiff", units = "in", width = 7.5, height = 10, res = 300) # load an empty tiff file with these dimensions
+combined.results # put in the final results plot
+dev.off() # close graphics so it saves
+```
+
+## Individual Chemical Plotting
+
+### Chemical 1: Chlorpyrifos
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Chlorpyrifos, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Chlorpyrifos
+Chlorpyrifos <- Final.Data %>%
+  filter(
+    Chemical == "Chlorpyrifos"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Chlorpyrifos <- Chlorpyrifos %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Chlorpyrifos.n.spec <- unique(Chlorpyrifos$nSpecies)
+Chlorpyrifos.n.spec
+
+# Relevel the factors to match the order
+Chlorpyrifos$nSpecies <- factor(Chlorpyrifos$nSpecies, levels = Chlorpyrifos.n.spec)
+       
+# Create the plot
+Chlorpyrifos.plot <- ggplot(Chlorpyrifos, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Chlorpyrifos$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Chlorpyrifos$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Chlorpyrifos$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Chlorpyrifos SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Chlorpyrifos.plot
+```
+
+### Chemical 2: Diazinon
+
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Diazinon, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Diazinon
+Diazinon <- Final.Data %>%
+  filter(
+    Chemical == "Diazinon"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Diazinon <- Diazinon %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Diazinon.n.spec <- unique(Diazinon$nSpecies)
+Diazinon.n.spec
+
+# Relevel the factors to match the order
+Diazinon$nSpecies <- factor(Diazinon$nSpecies, levels = Diazinon.n.spec)
+       
+# Create the plot
+Diazinon.plot <- ggplot(Diazinon, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Diazinon$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Diazinon$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Diazinon$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Diazinon SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Diazinon.plot
+```
+
+### Chemical 3: Dichlorvos
+
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Dichlorvos, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Dichlorvos
+Dichlorvos <- Final.Data %>%
+  filter(
+    Chemical == "Dichlorvos"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Dichlorvos <- Dichlorvos %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Dichlorvos.n.spec <- unique(Dichlorvos$nSpecies)
+Dichlorvos.n.spec
+
+# Relevel the factors to match the order
+Dichlorvos$nSpecies <- factor(Dichlorvos$nSpecies, levels = Dichlorvos.n.spec)
+       
+# Create the plot
+Dichlorvos.plot <- ggplot(Dichlorvos, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Dichlorvos$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Dichlorvos$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Dichlorvos$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Dichlorvos SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Dichlorvos.plot
+```
+
+
+### Chemical 4: Fenitrothion
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Fenitrothion, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Fenitrothion
+Fenitrothion <- Final.Data %>%
+  filter(
+    Chemical == "Fenitrothion"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Fenitrothion <- Fenitrothion %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Fenitrothion.n.spec <- unique(Fenitrothion$nSpecies)
+Fenitrothion.n.spec
+
+# Relevel the factors to match the order
+Fenitrothion$nSpecies <- factor(Fenitrothion$nSpecies, levels = Fenitrothion.n.spec)
+       
+# Create the plot
+Fenitrothion.plot <- ggplot(Fenitrothion, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Fenitrothion$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Fenitrothion$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Fenitrothion$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Fenitrothion SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Fenitrothion.plot
+```
+
+
+
+### Chemical 5: Fenthion
+
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Fenthion, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Fenthion
+Fenthion <- Final.Data %>%
+  filter(
+    Chemical == "Fenthion"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Fenthion <- Fenthion %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Fenthion.n.spec <- unique(Fenthion$nSpecies)
+Fenthion.n.spec
+
+# Relevel the factors to match the order
+Fenthion$nSpecies <- factor(Fenthion$nSpecies, levels = Fenthion.n.spec)
+       
+# Create the plot
+Fenthion.plot <- ggplot(Fenthion, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Fenthion$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Fenthion$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Fenthion$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Fenthion SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Fenthion.plot
+```
+
+
+### Chemical 6: Malathion
+
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Malathion, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Malathion
+Malathion <- Final.Data %>%
+  filter(
+    Chemical == "Malathion"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Malathion <- Malathion %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Malathion.n.spec <- unique(Malathion$nSpecies)
+Malathion.n.spec
+
+# Relevel the factors to match the order
+Malathion$nSpecies <- factor(Malathion$nSpecies, levels = Malathion.n.spec)
+       
+# Create the plot
+Malathion.plot <- ggplot(Malathion, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Malathion$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Malathion$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Malathion$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Malathion SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Malathion.plot
+```
+
+### Chemical 7: Methyl parathion
+
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Methyl parathion, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Methyl parathion
+Methyl.parathion <- Final.Data %>%
+  filter(
+    Chemical == "Methyl parathion"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Methyl.parathion <- Methyl.parathion %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Methyl.parathion.n.spec <- unique(Methyl.parathion$nSpecies)
+Methyl.parathion.n.spec
+
+# Relevel the factors to match the order
+Methyl.parathion$nSpecies <- factor(Methyl.parathion$nSpecies, levels = Methyl.parathion.n.spec)
+       
+# Create the plot
+Methyl.parathion.plot <- ggplot(Methyl.parathion, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Methyl.parathion$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Methyl.parathion$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Methyl.parathion$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Methyl parathion SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Methyl.parathion.plot
+```
+
+### Chemical 8: Naled
+
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Naled, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Naled
+Naled <- Final.Data %>%
+  filter(
+    Chemical == "Naled"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Naled <- Naled %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Naled.n.spec <- unique(Naled$nSpecies)
+Naled.n.spec
+
+# Relevel the factors to match the order
+Naled$nSpecies <- factor(Naled$nSpecies, levels = Naled.n.spec)
+       
+# Create the plot
+Naled.plot <- ggplot(Naled, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Naled$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Naled$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Naled$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Naled SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Naled.plot
+```
+
+### Chemical 9: Parathion
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Parathion, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Parathion
+Parathion <- Final.Data %>%
+  filter(
+    Chemical == "Parathion"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Parathion <- Parathion %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Parathion.n.spec <- unique(Parathion$nSpecies)
+Parathion.n.spec
+
+# Relevel the factors to match the order
+Parathion$nSpecies <- factor(Parathion$nSpecies, levels = Parathion.n.spec)
+       
+# Create the plot
+Parathion.plot <- ggplot(Parathion, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Parathion$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Parathion$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Parathion$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Parathion SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Parathion.plot
+```
+
+
+### Chemical 10: Trichlorfon
+
+#### Plot 1: Raw SSDn Output plot
+The chunk below filters the data only for Trichlorfon, then plots the raw output of all the SSDn results. The plot shows that overall, most nSpecies under-estimated the HC5 compared to the "true" HC5.
+```{r}
+# Filter the data to only include Trichlorfon
+Trichlorfon <- Final.Data %>%
+  filter(
+    Chemical == "Trichlorfon"
+  )
+
+# Arrange the nSpecies by the toxicity value (so the most sensitive species are at the top)
+Trichlorfon <- Trichlorfon %>%
+   arrange(average, nSpecies)
+
+# Extract the order of the species and check
+Trichlorfon.n.spec <- unique(Trichlorfon$nSpecies)
+Trichlorfon.n.spec
+
+# Relevel the factors to match the order
+Trichlorfon$nSpecies <- factor(Trichlorfon$nSpecies, levels = Trichlorfon.n.spec)
+       
+# Create the plot
+Trichlorfon.plot <- ggplot(Trichlorfon, aes(x = nSpecies, y = bf.HC5, color = nSpecies.Taxa))+ # X axis is the nSpecies, Y axis is the back-calculated HC5s that were generated from SSDs that used the nSpecies
+  geom_point(position = position_dodge(width = 0.5))+ # add in the points
+  geom_hline(yintercept = Trichlorfon$Single.C.HC5.bf, colour = "red")+ # Add the "true" HC5 as a red line across
+  geom_hline(yintercept = (Trichlorfon$Single.C.HC5.bf*5), colour = "red", linetype = 2)+ # Add the 5-fold higher mark as a dashed red line
+  geom_hline(yintercept = (Trichlorfon$Single.C.HC5.bf/5), colour = "red", linetype = 2)+ # Add the 5-fold lower mark as a dashed red line
+  geom_vline(xintercept = 3.5, linetype = 2)+ # Designate the first quartile to the left of the line
+  theme_bw()+ # black and white theme
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+ # rotate x axis labels 45 degrees for reading
+  scale_y_log10()+ # make whole graph log scale
+  xlab("nSpecies")+
+  ylab("HC5 (ug/L)")+
+  ggtitle("Trichlorfon SSDn Estimated HC5s (INVERTEBRATE ONLY)") # add title
+Trichlorfon.plot
+```
+
+
+# Save the results plot for the manuscript
+```{r}
+# save results plot for manuscript as a tiff file
+tiff("OP_Invert_Results.tiff", units = "in", width = 7.5, height = 7, res = 300) # load an empty tiff file with these dimensions
+comparison.plot # put in the final results plot
+dev.off() # close graphics so it saves
+```
+
+### Export the SI plots to a PDF
+put each plot on one page
+```{r}
+multi.page.plots <- ggarrange(Chlorpyrifos.plot, Diazinon.plot, Dichlorvos.plot, Fenitrothion.plot, Fenthion.plot, Malathion.plot, Methyl.parathion.plot, Naled.plot, Parathion.plot, Trichlorfon.plot, nrow=1, ncol=1) # for one plot per page
+
+multi.page.plots
+ggexport(multi.page.plots, filename="OP_Inverts_SI_Plots.pdf")
+```
+
+
+
+
