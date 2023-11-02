@@ -45,7 +45,7 @@ library(ggpubr) # for exporting plots
 The data we are loading here contains WEB-ICE data that has been filtered to only include chemicals that have data for at least 8 different species. We chose at least 8 species as our minimum data requirement for generating SSDs.
 ```{r}
 # Read in the WEB ICE data
-data <- read.csv("ICE_data_8_species.csv")
+data <- read.csv("https://raw.githubusercontent.com/glted-mib/SSDn-Code/main/ICE_data_8_species.csv")
 ```
 
 ### Filter the data to only include carbamate chemicals and fish species
