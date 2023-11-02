@@ -45,7 +45,7 @@ library(scales) # for plot scales
 Load in WEB-ICE data, prefiltered for only chemicals with data for 8+ species
 ```{r}
 # Read in the WEB ICE data
-data <- read.csv("ICE_data_8_species.csv")
+data <- read.csv("https://raw.githubusercontent.com/glted-mib/SSDn-Code/main/ICE_data_8_species.csv")
 ```
 
 ### Filter the data to only include organophosphate chemicals and fish species
