@@ -49,7 +49,7 @@ The data we are loading here contains WEB-ICE data that has been filtered to onl
 NOTE: If you are downloading this from an online source (ie supplementary material from a journal), then you will likely have a different name for your file. Please ensure that you read in the correct toxicity data here.
 ```{r}
 # Read in the WEB ICE data
-data <- read.csv("ICE_data_8_species.csv")
+data <- read.csv("https://raw.githubusercontent.com/glted-mib/SSDn-Code/main/ICE_data_8_species.csv")
 ```
 
 ### Filter the data to only include carbamate chemicals
