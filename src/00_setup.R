@@ -22,3 +22,15 @@ library(ggpubr) # for exporting plots
 
 # Read in the WEB ICE data
 data <- read.csv("https://raw.githubusercontent.com/glted-mib/SSDn-Code/main/ICE_data_8_species.csv")
+
+### Filter the data to only include carbamate chemicals and fish species
+data <- data %>%
+  filter(
+    Specific_MOA == "Carbamate"
+  )
+
+# Filter to only include fish species
+data <- data %>%
+  filter(
+    Taxa == "Fish"
+  )
