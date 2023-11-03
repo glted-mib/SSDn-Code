@@ -34,3 +34,6 @@ data <- data %>%
   filter(
     Taxa == "Fish"
   )
+
+#idk why Alex does this, but he checks that the data only has 5 chemicals
+unique(data$Chemical)
